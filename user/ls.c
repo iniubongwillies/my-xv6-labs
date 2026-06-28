@@ -4,8 +4,7 @@
 #include "kernel/fs.h"
 #include "kernel/fcntl.h"
 
-char*
-fmtname(char *path)
+char* fmtname(char *path)//返回最下面的文件名称
 {
   static char buf[DIRSIZ+1];
   char *p;
@@ -13,7 +12,7 @@ fmtname(char *path)
   // Find first character after last slash.
   for(p=path+strlen(path); p >= path && *p != '/'; p--)
     ;
-  p++;
+  p++;//
 
   // Return blank-padded name.
   if(strlen(p) >= DIRSIZ)
@@ -24,8 +23,7 @@ fmtname(char *path)
   return buf;
 }
 
-void
-ls(char *path)
+void ls(char *path)
 {
   char buf[512], *p;
   int fd;
@@ -73,8 +71,7 @@ ls(char *path)
   close(fd);
 }
 
-int
-main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
   int i;
 

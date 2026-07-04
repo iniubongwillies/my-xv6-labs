@@ -101,6 +101,34 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_interpose(void);
+
+
+// 这里是名字映射表
+static char *syscall_names[] = {
+  [SYS_fork]    "fork",
+  [SYS_exit]    "exit",
+  [SYS_wait]    "wait",
+  [SYS_pipe]    "pipe",
+  [SYS_read]    "read",
+  [SYS_kill]    "kill",
+  [SYS_exec]    "exec",
+  [SYS_fstat]   "fstat",
+  [SYS_chdir]   "chdir",
+  [SYS_dup]     "dup",
+  [SYS_getpid]  "getpid",
+  [SYS_sbrk]    "sbrk",
+  [SYS_pause]   "pause",
+  [SYS_uptime]  "uptime",
+  [SYS_open]    "open",
+  [SYS_write]   "write",
+  [SYS_mknod]   "mknod",
+  [SYS_unlink]  "unlink",
+  [SYS_link]    "link",
+  [SYS_mkdir]   "mkdir",
+  [SYS_close]   "close",
+  [SYS_interpose] "interpose",
+};
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,22 +154,40 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_interpose] sys_interpose,
 };
 
-void
-syscall(void)
-{
+void syscall(void) {
   int num;
   struct proc *p = myproc();
 
   num = p->trapframe->a7;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
-    p->trapframe->a0 = syscalls[num]();
+
+    // 1. 如果被 Mask 了，进入安检逻辑
+    if ((p->mask & (1 << num)) != 0) {
+      if (num == 15 || num == 7) { 
+        char path[MAXPATH];
+        if (copyinstr(p->pagetable, path, p->trapframe->a0, MAXPATH) == 0) {
+
+          if (strncmp(path, p->allowed_path, strlen(p->allowed_path)) == 0) {
+            goto allow; // 路径匹配，通过安检
+          }
+        }
+      }
+      // 没通过安检，直接返回
+      printf("sandbox: ... blocked ... \n");
+      p->trapframe->a0 = -1;
+      return;
+    }
+
+    allow: // 2. 标签位置
+    p->trapframe->a0 = syscalls[num](); // 这里执行系统调用
+
   } else {
-    printf("%d %s: unknown sys call %d\n",
-            p->pid, p->name, num);
+    // 3. 处理非法系统调用号
+   printf("sandbox: process %s blocked syscall %s (%d)\n", 
+             p->name, syscall_names[num], num);
     p->trapframe->a0 = -1;
   }
 }

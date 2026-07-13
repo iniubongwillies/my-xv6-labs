@@ -66,6 +66,8 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void* superalloc(void);      // 我返回的是指针！
+void            superfree(void *);     // 我接收一个指针！
 
 // log.c
 void            initlog(int, struct superblock*);

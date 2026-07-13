@@ -117,6 +117,27 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   return &pagetable[PX(0, va)];
 }
 
+pte_t *
+walk_super(pagetable_t pagetable, uint64 va, int alloc)
+{
+  if(va >= MAXVA)
+    panic("walk_super");
+
+  for(int level = 2; level > 1; level--) {
+    pte_t *pte = &pagetable[PX(level, va)];
+    if(*pte & PTE_V) {
+      pagetable = (pagetable_t)PTE2PA(*pte);
+    } else {
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+        return 0;
+      memset(pagetable, 0, PGSIZE);
+      *pte = PA2PTE(pagetable) | PTE_V;
+    }
+  }
+  
+  return &pagetable[PX(1, va)];
+}
+
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
@@ -171,15 +192,40 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   uint64 a, last;
   pte_t *pte;
 
-  if((va % PGSIZE) != 0)
-    panic("mappages: va not aligned");
-
-  if((size % PGSIZE) != 0)
-    panic("mappages: size not aligned");
+  // 💡 增加大页的对齐检查
+  if(size == SUPERPGSIZE) {
+    if((va % SUPERPGSIZE) != 0)
+      panic("mappages: va not superaligned");
+    if((pa % SUPERPGSIZE) != 0)
+      panic("mappages: pa not superaligned");
+  } else {
+    if((va % PGSIZE) != 0)
+      panic("mappages: va not aligned");
+    if((size % PGSIZE) != 0)
+      panic("mappages: size not aligned");
+  }
 
   if(size == 0)
     panic("mappages: size");
-  
+
+  // ==================== 🚀 【核心大页拦截逻辑】 ====================
+  if(size == SUPERPGSIZE) {
+    // 1. 使用我们专属的大页挖掘机，只挖到 Level 1
+    if((pte = walk_super(pagetable, va, 1)) == 0)
+      return -1;
+      
+    // 2. 检查这个 Level 1 的节点是否已经被别人占用了
+    if(*pte & PTE_V)
+      panic("mappages: superpage remap");
+      
+    // 3. 关键一步：直接在 Level 1 的页表项里写入物理大页地址和权限！
+    // 硬件看到 Level 1 节点具有 PTE_R/PTE_W 等权限位，就会自动识别为 2MB 大页
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    
+    return 0; // 大页挂载大功告成，直接退出函数！
+  }
+
+  // 如果不是 2MB 的大页，则完全退回到系统原本的 4KB 小页循环逻辑
   a = va;
   last = va + size - PGSIZE;
   for(;;){
@@ -217,12 +263,26 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz = PGSIZE;
+  int sz;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
+    // 拆大页
+    pte_t *pte_sp = walk_super(pagetable, a, 0);
+    if(pte_sp && (*pte_sp & PTE_V) && (*pte_sp & (PTE_R|PTE_W|PTE_X))){//PTE有效且有权限是大页
+      sz = SUPERPGSIZE; // 步长切换为 2MB，拆完这块直接跳过后面 511 块 4KB！
+      if(do_free){
+        uint64 pa = PTE2PA(*pte_sp);
+        superfree((void*)pa); // ⚠️ 必须用专属的 superfree 还给大砖厂
+      }
+      *pte_sp = 0; // 抹掉 Level 1 的记录
+      continue;    // 直接进入下一轮循环
+    }
+
+    //拆小页
+    sz = PGSIZE;
     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
       continue;
     if((*pte & PTE_V) == 0)  // has physical page been allocated?
@@ -252,12 +312,18 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
-  for(a = oldsz; a < newsz; a += sz){
-    sz = PGSIZE;
-    mem = kalloc();
-    if(mem == 0){
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
+for(a = oldsz; a < newsz; a += sz){
+    // 💡 智能判断：地址是 2MB 对齐，且剩余空间 >= 2MB，且成功拿到大页
+    if((a % SUPERPGSIZE) == 0 && (a + SUPERPGSIZE <= newsz) && ((mem = superalloc()) != 0)){
+      sz = SUPERPGSIZE; // 步长变身！
+    } else {
+      // 老规矩：拿 4KB 小砖头
+      sz = PGSIZE;
+      mem = kalloc();
+      if(mem == 0){
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
     }
 #ifndef LAB_SYSCALL
     memset(mem, 0, sz);
@@ -333,29 +399,55 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint flags;
   char *mem;
-  int szinc = PGSIZE;
+  int szinc; // 步长，不再固定为 PGSIZE，而是动态变化
 
   for(i = 0; i < sz; i += szinc){
+    //抄大页
+    pte_t *pte_sp = walk_super(old, i, 0); // 用你的大页挖掘机探路
+    
+    // 有效 (PTE_V) 且 具备读/写/执行权限 (说明它是大页实体，不是路标)
+    if(pte_sp && (*pte_sp & PTE_V) && (*pte_sp & (PTE_R|PTE_W|PTE_X))){
+      szinc = SUPERPGSIZE;             // 步长切换为 2MB
+      pa = PTE2PA(*pte_sp);
+      flags = PTE_FLAGS(*pte_sp);
+      
+      if((mem = superalloc()) == 0)    // 去你的专属仓库拿大预制板
+        goto err;
+        
+      memmove(mem, (char*)pa, SUPERPGSIZE); //一次性拷贝 2MB 数据！
+      
+      if(mappages(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+        superfree(mem);
+        goto err;
+      }
+      continue; // 这 2MB 抄完了，直接跳过后面的代码，进入下一轮循环！
+    }
+    // ===============================================================
+
+    //：抄小页
+    szinc = PGSIZE; // 步长切回 4KB
     if((pte = walk(old, i, 0)) == 0)
       continue;
     if((*pte & PTE_V) == 0) {
       continue;
     }
-    szinc = PGSIZE;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    if((mem = (char *)kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
       goto err;
     }
+    // ===============================================================
   }
   return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+err:
+  // 把子进程的页表彻底清空，从 0 到 sz，全部释放，不留死角！
+  // 注意：sz 是 uvmcopy 的传入参数，代表总大小
+  uvmunmap(new, 0, sz / PGSIZE, 1); 
   return -1;
 }
 
@@ -537,3 +629,30 @@ pgpte(pagetable_t pagetable, uint64 va) {
   return walk(pagetable, va, 0);
 }
 #endif
+
+void
+vmprint_helper(pagetable_t pagetable, int level)
+{
+  // 1. 写一个跑 512 次的 for 循环
+  for(int i = 0; i < 512; i++){
+    
+    // 2. 取出当前的 pte
+    pte_t pte = pagetable[i];
+    
+    // 3. ，写一个 if 判断它是否有效 (PTE_V)
+     if(pte & PTE_V){
+    //第一步：根据 level 打印前面的点点和空格
+      for(int j = 0; j < level; j++){
+        printf(".. ");
+      }
+    // 第二步：打印具体内容
+    uint64 pa = PTE2PA(pte);
+    printf("%d: pte %p pa %p\n", i, (void*)pte, (void*)pa);
+
+      if(level < 3){
+        // 把提取出来的物理地址当做下一级的页表传进去，层数 +1
+        vmprint_helper((pagetable_t)pa, level + 1);
+      }
+    }
+  }
+}

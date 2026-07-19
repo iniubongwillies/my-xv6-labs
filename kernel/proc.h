@@ -92,6 +92,12 @@ struct proc {
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
 
+  int alarm_interval;          // 闹钟间隔 (ticks)
+  uint64 alarm_handler;        // 报警处理函数的内存地址
+  int ticks_passed;            // 自从上次闹钟响过之后，已经过去的 ticks 数
+  struct trapframe *alarm_tf;  // 用于保存被打断时的寄存器状态（保护现场）
+  int is_alarming;             // 标志位：当前是否正在执行 handler（防止重入）
+
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 

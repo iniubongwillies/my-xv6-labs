@@ -81,8 +81,19 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    if(p -> alarm_interval > 0 && p -> is_alarming == 0){
+      p -> ticks_passed++;
+      if(p -> ticks_passed >= p -> alarm_interval){
+        p -> is_alarming = 1;
+        memmove(p->alarm_tf, p->trapframe, sizeof(struct trapframe));
+        p->trapframe->epc = p->alarm_handler;
+        p -> ticks_passed = 0;
+      }
+    }
     yield();
+  }
+   
 
   prepare_return();
 

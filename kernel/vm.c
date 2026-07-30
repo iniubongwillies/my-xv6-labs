@@ -299,7 +299,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,11 +308,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(flags & PTE_W) 
+    {
+    flags &= ~PTE_W;           // 清除子进程 flags 里的写权限
+    flags |= PTE_COW;          // 给子进程加上 COW 标记
+    
+    *pte &= ~PTE_W;            // 清除父进程 PTE 里的写权限
+    *pte |= PTE_COW;           // 给父进程加上 COW 标记
+    }
+    //if((mem = kalloc()) == 0)
+    //  goto err;
+    //memmove(mem, (char*)pa, PGSIZE);
+    krefinc((void*)pa);//增加物理页的引用计数
+
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      kfree((void*)pa);
       goto err;
     }
   }
@@ -358,9 +368,19 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
+   
     // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
-      return -1;
+    if((*pte & PTE_W) == 0){
+       if(*pte & PTE_COW) {
+      // 既然已经在内核里了，直接调函数修复！
+      pa0 = (uint64)cow_alloc(pagetable, va0);
+      if(pa0 == 0) {
+        return -1; // 内存真的不够了才报错
+        }
+      }
+      else return -1;
+    }
+     
       
     n = PGSIZE - (dstva - va0);
     if(n > len)
@@ -483,4 +503,42 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+
+void *
+cow_alloc(pagetable_t pagetable, uint64 va){
+  if(va >= MAXVA)
+    return 0;
+  // 必须把引发异常的虚拟地址向下取整到页面边界 (4096的倍数)
+  // 因为页表项 (PTE) 是以页为单位管理的
+  va = PGROUNDDOWN(va);
+  // === 第一步 & 第二步：案发现场身份核实 ===
+  pte_t *pte = walk(pagetable,va,0);//找到对应pte
+  if(pte == 0) return 0; //pte不存在
+  if((*pte & PTE_V) == 0) return 0; //pte无效
+  if((*pte & PTE_U) == 0) return 0; //pte不是用户态页面
+  if((*pte & PTE_COW) == 0) return 0; //非法写入
+
+  uint64 pa = PTE2PA(*pte); // 拿到旧物理页的地址 (Old_PA)
+
+  // === 第三步：偷梁换柱 (分配与拷贝) ===
+  char *new_page = kalloc();
+  if(new_page == 0) {
+    return 0; // 内存耗尽了，分配失败
+  }
+  memmove(new_page,(char*)pa,PGSIZE);
+
+  // === 第四步：重新拉线 (修改 PTE) ===
+  uint64 flags = PTE_FLAGS(*pte);
+  flags &= ~PTE_COW;  // 摘除 COW 标签
+  flags |= PTE_W;     // 恢复可写权限 (PTE_W)
+
+  // 让该虚拟地址的 PTE 指向新物理页，并附上新的权限标志
+  *pte = PA2PTE(new_page) | flags;
+
+  // === 第五步：善后清理 ===
+  // 调用你改过的 kfree，它只会把旧物理页的引用计数减 1
+  kfree((void*)pa);
+
+  return (void*)new_page;
 }

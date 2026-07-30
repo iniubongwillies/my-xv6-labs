@@ -66,7 +66,16 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if (r_scause() == 15){
+    //拿到虚拟地址
+    uint64 fault_va = r_stval();
+    //传入当前进程的页表 (p->pagetable) 和这个出错的虚拟地址 (fault_va)
+    if(cow_alloc(p->pagetable, fault_va) < 0) {
+      //处理函数发现这根本不是 COW 页，或者系统内存不够了，分配失败
+      p->killed = 1; // 判处当前进程死刑
+    }
+
+  }else if((which_dev = devintr()) != 0){
     // ok
   } else if((r_scause() == 15 || r_scause() == 13) &&
             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {

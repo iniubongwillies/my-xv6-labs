@@ -126,12 +126,21 @@ read_acquire_inner(struct rwspinlock *rwlk)
 {
   // Replace this with your implementation.
   acquire(&rwlk->l);
+  while(rwlk->flag != 0 || rwlk->wait != 0){
+    release(&rwlk->l); //条件不满足释放锁
+    acquire(&rwlk->l); //再次获得锁，准备下一次进入while
+  }
+  //条件满足
+  rwlk->count++;
+  release(&rwlk->l); // 已读，释放锁
 }
 
 static void
 read_release_inner(struct rwspinlock *rwlk)
 {
   // Replace this with your implementation.
+  acquire(&rwlk->l); // 获得锁
+  rwlk->count--;
   release(&rwlk->l);
 }
 
@@ -140,12 +149,22 @@ write_acquire_inner(struct rwspinlock *rwlk)
 {
   // Replace this with your implementation.
   acquire(&rwlk->l);
+  rwlk->wait ++;
+  while(rwlk->flag != 0 || rwlk->count != 0){
+    release(&rwlk->l); //条件不满足释放锁
+    acquire(&rwlk->l); //再次获得锁，准备下一次进入while
+  }
+  //条件满足
+  rwlk->wait --; rwlk->flag = 1;
+  release(&rwlk->l); //释放锁
 }
 
 static void
 write_release_inner(struct rwspinlock *rwlk)
 {
   // Replace this with your implementation.
+  acquire(&rwlk->l);
+  rwlk->flag = 0;
   release(&rwlk->l);
 }
 
@@ -180,8 +199,10 @@ write_release(struct rwspinlock *rwlk)
 void
 initrwlock(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  initlock(&rwlk->l, "rwlk");
+  initlock(&rwlk->l, "rwlk"); 
+  rwlk->count = 0;            
+  rwlk->flag = 0;             
+  rwlk->wait = 0;             
 }
 
 // Test rwspinlock implementation.

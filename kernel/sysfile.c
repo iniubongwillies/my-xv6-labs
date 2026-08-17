@@ -309,6 +309,8 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
+  int depth = 0;
+  char target[MAXPATH];
 
   argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
@@ -328,6 +330,37 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+
+    while (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW))
+    {
+      if(depth > 10){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      // 读出目标路径
+      if(readi(ip, 0, (uint64)target, 0, MAXPATH)<= 0) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      // 换新 inode
+      // 既然路径拿到了，当前这个软链接的 ip 就没用了
+      iunlockput(ip); // 丢掉旧的
+      // 根据读出来的 target，去找新的 inode
+      if((ip = namei(target)) == 0) { // 如果新路径根本不存在
+      end_op();
+      return -1;
+      }
+    
+      // 给新找到的 ip 上锁，准备下一次循环检查，或者退出循环继续正常 open 流程
+      ilock(ip); 
+    
+      // 增加跳跃次数！
+      depth++;
+    }
+    
+  
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -501,5 +534,38 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  // 第 0 个参数 (target)，如果失败返回 -1
+  if(argstr(0, target, MAXPATH) < 0)
+    return -1;
+    
+  // 第 1 个参数 (path)，如果失败返回 -1
+  if(argstr(1, path, MAXPATH) < 0)
+    return -1;
+  
+  begin_op();
+
+  ip = create(path , T_SYMLINK,0 ,0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+  //把target里面的数据写入ip文件里面
+  if( writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target) ) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+
   return 0;
 }

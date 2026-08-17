@@ -439,6 +439,49 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
+  if(bn < NDOUBLYINDIRECT){
+    // 1. 获取/分配二级间接块本身 (位于 ip->addrs[NDIRECT+1])
+    if((addr = ip->addrs[NDIRECT+1]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0)
+        return 0; // 空间不足直接返回 0
+      ip->addrs[NDIRECT+1] = addr;
+    }
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    // 2. 计算第一层索引 (去找哪个一级间接块)
+    int level1_idx = bn / NINDIRECT;
+    if((addr = a[level1_idx]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0){
+        brelse(bp); // 失败时先释放缓冲区，防止内存死锁
+        return 0;
+      }
+      a[level1_idx] = addr;
+      log_write(bp);
+    }
+    brelse(bp); // 释放二级间接块
+
+    // 3. 读取该一级间接块
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    // 4. 计算第二层索引 (在这个一级块中找具体的数据块)
+    int level2_idx = bn % NINDIRECT;
+    if((addr = a[level2_idx]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0){
+        brelse(bp); // 失败时先释放缓冲区
+        return 0;
+      }
+      a[level2_idx] = addr;
+      log_write(bp);
+    }
+    brelse(bp); // 释放一级间接块
+    return addr;
+  }
 
   panic("bmap: out of range");
 }
@@ -469,6 +512,29 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+  //释放二级索引块
+  if(ip->addrs[NDIRECT+1]){
+    struct buf *bp = bread(ip->dev, ip->addrs[NDIRECT+1]); // 读入二级索引块的inode
+    uint *a = (uint*)bp->data; 
+    
+    for(j = 0; j < NINDIRECT; j++){ 
+      if(a[j]){ // 如果这个一级索引存在
+        struct buf *bp2 = bread(ip->dev, a[j]); // 读入一级索引的inode
+        uint *a2 = (uint*)bp2->data;
+        
+        for(int k = 0; k < NINDIRECT; k++){ 
+          if(a2[k]){ // 如果这个数据块存在
+            bfree(ip->dev, a2[k]); // 释放数据块
+          }
+        }
+        brelse(bp2);
+        bfree(ip->dev, a[j]); // 释放完数据块后，释放一级块
+      }
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT+1]); // 所有一级块都释放了，释放二级块
+    ip->addrs[NDIRECT+1] = 0; //移除内存块bigfile
   }
 
   ip->size = 0;

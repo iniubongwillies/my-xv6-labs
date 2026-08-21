@@ -4,8 +4,11 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sleeplock.h"
+#include "fs.h"       // 【关键】必须先加载 fs.h (这里定义了 NDIRECT)
+#include "file.h"     // 【关键】然后再加载 file.h (它用到了 fs.h 里的定义)
+#include "fcntl.h"
 #include "defs.h"
-
 struct spinlock tickslock;
 uint ticks;
 
@@ -71,7 +74,48 @@ usertrap(void)
   } else if((r_scause() == 15 || r_scause() == 13) &&
             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
     // page fault on lazily-allocated page
-  } else {
+  }else if (r_scause() == 13 || r_scause() == 15) {
+    uint64 fault_va = r_stval();
+    struct proc *p = myproc();
+    struct vma *v = 0;
+    
+    // 1. 查找对应的 VMA
+    for (int i = 0; i < MAX_VMA; i++) {
+        if (p->vmas[i].valid && fault_va >= p->vmas[i].addr && fault_va < p->vmas[i].addr + p->vmas[i].len) {
+            v = &p->vmas[i];
+            break;
+        }
+    }
+    
+    // 2. 权限与合法性校验 (核心修复区)
+    // 如果找不到 VMA，或者试图对没有 PROT_WRITE 权限的页面执行写操作 (scause == 15)
+    if (v == 0 || (r_scause() == 15 && (v->prot & PROT_WRITE) == 0)) {
+        p->killed = 1; // 越权操作，直接赐死进程
+    } else {
+        // 3. 正常的按需分配页与映射
+        uint64 page_va = PGROUNDDOWN(fault_va);
+        void* pa = kalloc();
+        if (pa == 0) {
+            p->killed = 1;
+        } else {
+            memset(pa, 0, PGSIZE);
+            int pte_flags = PTE_U;
+            if (v->prot & PROT_READ) pte_flags |= PTE_R;
+            if (v->prot & PROT_WRITE) pte_flags |= PTE_W;
+            
+            struct inode *ip = v->f->ip;
+            ilock(ip);
+            readi(ip, 0, (uint64)pa, page_va - v->addr + v->offset, PGSIZE);
+            iunlock(ip);
+            
+            if (mappages(p->pagetable, page_va, PGSIZE, (uint64)pa, pte_flags) != 0) {
+                kfree(pa);
+                p->killed = 1;
+            }
+        }
+    }
+  }
+  else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);

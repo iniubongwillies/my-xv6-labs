@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -501,5 +502,134 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int len, prot, flags, fd, offset;
+  struct file *f;
+  argaddr(0, &addr);
+  argint(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if (argfd(4, &fd, &f) < 0) {
+    return 0xffffffffffffffff;
+  }
+  argint(5, &offset);
+
+  // 权限校验
+  if ((prot & PROT_READ) && !f->readable)
+    return 0xffffffffffffffff;
+  if ((prot & PROT_WRITE) && !f->writable && (flags & MAP_SHARED))
+    return 0xffffffffffffffff;
+
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  // 1. 寻找一个空闲的 VMA 槽位
+  for(int i = 0; i < MAX_VMA; i++){
+    if(p->vmas[i].valid == 0){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if (v == 0) return 0xffffffffffffffff;
+
+  // 2. 动态计算新 VMA 的映射地址 (向下生长)
+  uint64 min_addr = TRAPFRAME;
+  for (int i = 0; i < MAX_VMA; i++) {
+    // 找出当前所有 VMA 中最低的地址，防止多个 mmap 互相重叠
+    if (p->vmas[i].valid && p->vmas[i].addr < min_addr) {
+      min_addr = p->vmas[i].addr;
+    }
+  }
+
+  uint64 new_addr = PGROUNDDOWN(min_addr - len);
+  
+  // 防止映射区域撞到进程的堆 (heap)
+  if (new_addr < p->sz) {
+    return 0xffffffffffffffff;
+  }
+
+  // 3. 记录 VMA 信息
+  v->addr = new_addr;
+  v->len = len;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = f;
+  v->valid = 1;
+  v->offset = offset;
+  
+  // 增加文件引用计数
+  filedup(f);
+
+  return new_addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int len;
+  argaddr(0, &addr);
+  argint(1, &len);
+
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  for(int i = 0; i < MAX_VMA; i++){
+    if(p->vmas[i].valid && addr >= p->vmas[i].addr && addr < p->vmas[i].addr + p->vmas[i].len){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  
+  if(v == 0) return -1;
+
+  if((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE)){
+    begin_op();
+    for(uint64 va = addr; va < addr + len; va += PGSIZE){
+      pte_t *pte = walk(p->pagetable, va, 0);
+      // 绝对不要检查 PTE_D，只要页面有效就无条件写回！
+      if(pte && (*pte & PTE_V)){
+        uint64 pa = PTE2PA(*pte);
+        uint64 mem_off = va - v->addr;
+        uint64 file_off = mem_off + v->offset;
+        int tot = v->len - mem_off;
+        int n = (tot < PGSIZE) ? tot : PGSIZE;
+        if(n <= 0) break;
+        
+        struct inode *ip = v->f->ip;
+        ilock(ip);
+        // 极限防守：不允许写入超过文件真实大小，防止文件被意外撑大
+        uint max_write = (ip->size > file_off) ? (ip->size - file_off) : 0;
+        if(n > max_write) n = max_write;
+        
+        if(n > 0){
+          writei(ip, 0, pa, file_off, n);
+        }
+        iunlock(ip);
+      }
+    }
+    end_op();
+  }
+
+  int npages = PGROUNDUP(len) / PGSIZE;
+  uvmunmap(p->pagetable, addr, npages, 1);
+
+  if(addr == v->addr && len == v->len) {
+    v->valid = 0;
+    fileclose(v->f);
+  } else if(addr == v->addr) {
+    v->addr += len;
+    v->len -= len;
+    v->offset += len;
+  } else {
+    v->len -= len;
+  }
+
   return 0;
 }

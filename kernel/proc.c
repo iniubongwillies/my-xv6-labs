@@ -1,10 +1,15 @@
-#include "types.h"
-#include "param.h"
 #include "memlayout.h"
+#include "types.h"
 #include "riscv.h"
-#include "spinlock.h"
-#include "proc.h"
 #include "defs.h"
+#include "param.h"
+#include "stat.h"
+#include "spinlock.h"
+#include "sleeplock.h" // 必须在 file.h 之前
+#include "fs.h"        // 必须在 file.h 之前
+#include "file.h"
+#include "fcntl.h"
+#include "proc.h"
 
 struct cpu cpus[NCPU];
 
@@ -253,6 +258,7 @@ growproc(int n)
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
+
 int
 kfork(void)
 {
@@ -285,6 +291,16 @@ kfork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // 复制父进程的 VMA 账本到子进程，并增加文件引用计数
+  for(i = 0; i < MAX_VMA; i++){
+    if(p->vmas[i].valid){
+      np->vmas[i] = p->vmas[i];
+      filedup(np->vmas[i].f);
+    } else {
+      np->vmas[i].valid = 0;
+    }
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -301,7 +317,6 @@ kfork(void)
 
   return pid;
 }
-
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
 void
@@ -327,6 +342,43 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  for(int i = 0; i < MAX_VMA; i++){
+    if(p->vmas[i].valid){
+      struct vma *v = &p->vmas[i];
+      if((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE)){
+        begin_op();
+        for(uint64 va = v->addr; va < v->addr + v->len; va += PGSIZE){
+          pte_t *pte = walk(p->pagetable, va, 0);
+          // 同样去掉 PTE_D 的执念
+          if(pte && (*pte & PTE_V)){
+            uint64 pa = PTE2PA(*pte);
+            uint64 mem_off = va - v->addr;
+            uint64 file_off = mem_off + v->offset;
+            int tot = v->len - mem_off;
+            int n = (tot < PGSIZE) ? tot : PGSIZE;
+            if(n <= 0) break;
+            
+            struct inode *ip = v->f->ip;
+            ilock(ip);
+            // 同样加上边界保护
+            uint max_write = (ip->size > file_off) ? (ip->size - file_off) : 0;
+            if(n > max_write) n = max_write;
+            
+            if(n > 0){
+              writei(ip, 0, pa, file_off, n);
+            }
+            iunlock(ip);
+          }
+        }
+        end_op();
+      }
+      int npages = PGROUNDUP(v->len) / PGSIZE;
+      uvmunmap(p->pagetable, v->addr, npages, 1);
+      fileclose(v->f);
+      v->valid = 0;
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
@@ -361,7 +413,6 @@ kexit(int status)
   sched();
   panic("zombie exit");
 }
-
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
 int
